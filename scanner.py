@@ -1,92 +1,80 @@
-# stock_surge_top250.py
-# TOP 250 HIGH-VOLUME STOCKS | <10s SCANS | v2.4 YFINANCE SCREENER
+# surge_hunter_v11.0.py - RENDER READY
 import yfinance as yf
-import pandas as pd
 import asyncio
 import schedule
 import time
 import logging
+import os
 from telegram import Bot
 from datetime import datetime
 import pytz
 from concurrent.futures import ThreadPoolExecutor
 
 # ========================= CONFIG =========================
-TELEGRAM_TOKEN = '8495322474:AAEh2inn7ArIj2GAkSfm0iQWqVc5gE_UyFA'
-CHAT_ID = '7276470276'
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise ValueError("Set TELEGRAM_TOKEN and CHAT_ID as Environment Variables!")
 
 TRADING_START_CST = "08:30"
 TRADING_END_CST = "15:00"
 WINDOW_MINUTES = 5
-MIN_PRICE_SURGE_PCT = 1.2
-MIN_VOLUME_MULTIPLIER = 2.0
+MIN_PRICE_SURGE_PCT = 0.6
+MIN_VOLUME_MULTIPLIER = 1.5
+MIN_PRICE = 0.5
+MIN_VOLUME_5MIN = 50_000
 
 CST = pytz.timezone('America/Chicago')
-MAX_WORKERS = 50
+MAX_WORKERS = 100
+
+# RELATIVE PATH FOR RENDER
+TICKERS_FILE_PATH = './tickers.txt'
 # ==========================================================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Render logs to stdout
+    ]
+)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === FETCH 250 MOST ACTIVE via YFINANCE SCREENER (NO SCRAPING) ===
-def fetch_top_250_active():
+# === LOAD TICKERS ===
+def load_tickers_from_file():
+    if not os.path.exists(TICKERS_FILE_PATH):
+        raise FileNotFoundError(f"tickers.txt not found in project root!")
+    
     try:
-        # yfinance built-in screener
-        screen = yf.Tickers(' '.join(['AAPL']))  # Dummy to init
-        df = yf.utils.get_screeners(['most_actives'])['most_actives']
+        with open(TICKERS_FILE_PATH, 'r', encoding='utf-8') as f:
+            raw_tickers = [line.strip() for line in f if line.strip()]
         
-        # Extract symbols
-        tickers = df['Symbol'].tolist()[:300]  # Get extra
-        tickers = [t.replace('.', '-') for t in tickers]  # Fix format
-        tickers = list(dict.fromkeys(tickers))[:250]  # Dedupe + cap
+        cleaned = [t.strip().upper() for t in raw_tickers 
+                  if 1 <= len(t.strip()) <= 5 and t.strip().replace('.', '').isalnum()]
+        tickers = sorted(list(set(cleaned)))
         
-        logger.info(f"Fetched {len(tickers)} most active tickers via yfinance screener.")
+        logger.info(f"Loaded {len(tickers)} tickers from tickers.txt")
         return tickers
     except Exception as e:
-        logger.warning(f"Screener failed: {e}, using fallback.")
-        return get_fallback_top_250()
+        raise RuntimeError(f"Failed to load tickers: {e}")
 
+ALL_TICKERS = load_tickers_from_file()
+LIVE_TICKERS = ALL_TICKERS.copy()
 
-# === FALLBACK: 250 HIGH-VOLUME TICKERS (GUARANTEED) ===
-def get_fallback_top_250():
-    return [
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AMD', 'SMCI', 'ARM',
-        'AVGO', 'QCOM', 'TXN', 'MU', 'ASML', 'LRCX', 'KLAC', 'AMAT', 'SNOW', 'CRWD',
-        'ZS', 'PANW', 'FTNT', 'DDOG', 'NET', 'MDB', 'HUBS', 'TEAM', 'COIN', 'HOOD',
-        'SOFI', 'UPST', 'AFRM', 'MARA', 'RIOT', 'CLSK', 'BITF', 'LCID', 'RIVN', 'NIO',
-        'XPEV', 'LI', 'BLNK', 'CHPT', 'PLUG', 'FCEL', 'BE', 'HIMS', 'CLOV', 'OSCR',
-        'TDOC', 'RXRX', 'VIR', 'MRNA', 'BNTX', 'NVAX', 'GME', 'AMC', 'BB', 'KOSS',
-        'SPCE', 'RKLB', 'ASTS', 'BABA', 'PDD', 'JD', 'BIDU', 'NTES', 'TME', 'BZ',
-        'VIPS', 'IQ', 'WB', 'SPY', 'QQQ', 'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'LABU',
-        'LABD', 'SPXL', 'SPXS', 'ARKK', 'ARKQ', 'ARKW', 'ARKG', 'ARKF', 'IBIT',
-        'GBTC', 'BITO', 'MSTR', 'SOUN', 'PLTR', 'IONQ', 'RGTI', 'QBTS', 'QUBT',
-        'AUR', 'PATH', 'U', 'AI', 'SATS', 'LUMN', 'BAC', 'WFC', 'JPM', 'C', 'GS',
-        'MS', 'SCHW', 'PFE', 'MRK', 'JNJ', 'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'HAL',
-        'KMI', 'WMB', 'ET', 'EPD', 'F', 'GM', 'HMC', 'TM', 'RACE', 'STLA', 'NOC',
-        'LMT', 'RTX', 'BA', 'DIS', 'CMCSA', 'VZ', 'T', 'TMUS', 'CHTR', 'EA', 'TTWO',
-        'ROKU', 'SHOP', 'SE', 'MELI', 'NU', 'XP', 'ITUB', 'BBD', 'VALE', 'PBR', 'EC',
-        'TSM', 'INFY', 'HDB', 'WIT', 'VOD', 'BTI', 'UL', 'DEO', 'NVS', 'NVO', 'AZN',
-        'SNY', 'GSK', 'ABBV', 'LLY', 'TMO', 'DHR', 'ABT', 'MDT', 'UNH', 'CI', 'HUM',
-        'CVS', 'DG', 'DLTR', 'TGT', 'WMT', 'COST', 'HD', 'LOW', 'TJX', 'ROST', 'M',
-        'KSS', 'AEO', 'URBN', 'ANF', 'LULU', 'NKE', 'VFC', 'PVH', 'RL', 'TPR', 'CPRI',
-        'SIG', 'MOV', 'CROX', 'DECK', 'COLM', 'UA', 'UAA', 'CCL', 'RCL', 'NCLH', 'DAL',
-        'AAL', 'UAL', 'LUV', 'SAVE', 'JBLU', 'ALK', 'HA', 'MESA', 'SKYW', 'EXPR',
-        'GME', 'AMC', 'BBBY', 'KODK', 'DKS', 'HIBB', 'FL', 'GPS', 'JWN', 'EXPR'
-    ][:250]
+def refresh_tickers():
+    global LIVE_TICKERS
+    LIVE_TICKERS = load_tickers_from_file()
+    logger.info(f"Refreshed: {len(LIVE_TICKERS)} tickers")
 
-
-# === GLOBAL ===
-HOT_STOCKS = []
-
-
-# === ULTRA-FAST SYNC FETCH ===
-def fetch_ticker_sync(symbol):
+# === SURGE DETECTION (UNCHANGED) ===
+def detect_surge(symbol):
     try:
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d", interval="1m", prepost=False, timeout=8)
-        if hist.empty or len(hist) < WINDOW_MINUTES:
+        hist = ticker.history(period="1d", interval="1m", prepost=False, timeout=6)
+        if hist.empty or len(hist) < WINDOW_MINUTES + 10:
             return None
 
         recent = hist.tail(WINDOW_MINUTES)
@@ -96,68 +84,65 @@ def fetch_ticker_sync(symbol):
             return None
 
         price_change = ((price_end / price_start) - 1) * 100
-        volume_ratio = recent['Volume'].mean() / hist['Volume'].head(20).mean()
+        recent_vol = recent['Volume'].mean()
+        baseline_vol = hist['Volume'].head(20).mean()
+        volume_ratio = recent_vol / baseline_vol if baseline_vol > 0 else 0
 
-        if price_change >= MIN_PRICE_SURGE_PCT and volume_ratio >= MIN_VOLUME_MULTIPLIER:
+        if (price_end >= MIN_PRICE and 
+            recent_vol >= MIN_VOLUME_5MIN and 
+            price_change >= MIN_PRICE_SURGE_PCT and 
+            volume_ratio >= MIN_VOLUME_MULTIPLIER):
+            
             return {
                 'symbol': symbol,
                 'change': price_change,
-                'volume': volume_ratio
+                'volume': volume_ratio,
+                'price': price_end,
+                'vol_5min': int(recent_vol)
             }
-    except Exception:
+    except:
         pass
     return None
 
-
-# === ULTRA-FAST ASYNC SCAN ===
-async def ultra_fast_scan_async():
+# === SCAN + ALERTS (UNCHANGED) ===
+async def dynamic_surge_scan():
     if not is_market_open():
-        logger.info("Market closed (CST)")
         return
 
     current_time = datetime.now(CST).strftime("%H:%M")
-    logger.info(f"SCANNING TOP 250 @ {current_time} CST | {len(HOT_STOCKS)} stocks")
+    logger.info(f"SCANNING {len(LIVE_TICKERS)} TICKERS @ {current_time} CST")
 
     start_time = time.time()
     loop = asyncio.get_event_loop()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        tasks = [loop.run_in_executor(executor, fetch_ticker_sync, s) for s in HOT_STOCKS]
+        tasks = [loop.run_in_executor(executor, detect_surge, s) for s in LIVE_TICKERS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     alerts = [r for r in results if isinstance(r, dict)]
     duration = time.time() - start_time
 
-    logger.info(f"Scan complete in {duration:.2f}s | {len(alerts)} surge(s) detected!")
+    logger.info(f"Scan complete in {duration:.1f}s | {len(alerts)} surges!")
 
     for alert in alerts:
         message = (
-            f"<b>TOP 250 SURGE!</b>\n\n"
-            f"<b>{alert['symbol']}</b>\n"
-            f"+{alert['change']:.2f}%\n"
-            f"{alert['volume']:.1f}x Volume\n"
+            f"<b>SURGE DETECTED!</b>\n\n"
+            f"<b>{alert['symbol']}</b> @ ${alert['price']:.3f}\n"
+            f"+{alert['change']:.2f}% (5 min)\n"
+            f"{alert['volume']:.1f}x volume ({alert['vol_5min']:,} shares)\n"
             f"{current_time} CST\n"
             f"<a href='https://finance.yahoo.com/quote/{alert['symbol']}'>TRADE NOW</a>"
         )
         await send_telegram(message)
-        try:
-            import winsound
-            winsound.Beep(1600, 700)
-        except:
-            pass
 
-
-# === TELEGRAM ===
 async def send_telegram(message):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
-        symbol = message.split('<b>')[2].split('</b>')[0]
-        logger.info(f"Telegram alert sent: {symbol}")
+        symbol = message.split('<b>')[1].split('</b>')[0]
+        logger.info(f"🚀 ALERT → {symbol}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-
-# === MARKET HOURS ===
 def is_market_open():
     now = datetime.now(CST)
     if now.weekday() >= 5:
@@ -165,36 +150,25 @@ def is_market_open():
     current = now.strftime("%H:%M")
     return TRADING_START_CST <= current < TRADING_END_CST
 
-
-# === WRAPPER ===
-def ultra_fast_scan():
-    asyncio.run(ultra_fast_scan_async())
-
+def run_scan():
+    asyncio.run(dynamic_surge_scan())
 
 # === MAIN LOOP ===
-def start_bot():
-    global HOT_STOCKS
-    if not TELEGRAM_TOKEN or 'YOUR_' in TELEGRAM_TOKEN:
-        logger.error("UPDATE TELEGRAM_TOKEN!")
-        return
-
-    HOT_STOCKS = fetch_top_250_active()
-    if len(HOT_STOCKS) < 100:
-        HOT_STOCKS = get_fallback_top_250()
-
-    logger.info(f"Loaded {len(HOT_STOCKS)} high-volume stocks")
-    logger.info("TOP 250 STOCK SURGE BOT STARTED! (v2.4 FINAL)")
-
-    schedule.every(60).seconds.do(ultra_fast_scan)
+def start_hunter():
+    logger.info("🚀 SURGE HUNTER v11.0 LIVE ON RENDER!")
+    refresh_tickers()
+    
+    schedule.every(60).seconds.do(run_scan)
+    schedule.every(30).minutes.do(refresh_tickers)
 
     try:
         while True:
             schedule.run_pending()
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Hunter stopped.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
 
-
-# === RUN ===
 if __name__ == "__main__":
-    start_bot()
+    start_hunter()
