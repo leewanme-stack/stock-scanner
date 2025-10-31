@@ -1,334 +1,200 @@
-    #Filter              Threshold          Why
-    #price_accel         ≥0.4%              Last minute momentum
-    #vol_spike           ≥ 3.0x             Sudden volume burst
-    #vola_spike          ≥ 0.003            Price instability
-    #ML anomaly          IsolationForest    Detects unusual patterns
-
-    # --------- ML Optimization
-    #Before                  After
-    #7d data per stock,      1d data
-    #5m intervals,           1m intervals
-    #150 samples/stock,      50 samples/stock
-    #8 stocks,               5 high-volume
-    #Full download(),        cached yf.Ticker()
-
-    # ------ Real Time Sentiments Analysis
-    #Source,Speed,               Accuracy
-    #X (Twitter),                < 3s,90%+
-    #StockTwits,                 < 2s,85%+
-    #Reddit (r/wallstreetbets),  < 5s,80%+
-
-# stock_surge_top300_dynamic_v8.py
-# v8.0 | 429-PROOF | HYBRID 30→300+ | REAL-TIME ML+SENTIMENT | WHATSAPP
+# stock_surge_top250.py
+# TOP 250 HIGH-VOLUME STOCKS | <10s SCANS | v2.4 YFINANCE SCREENER
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import requests
-import time
-import pytz
-import logging
+import asyncio
 import schedule
-import os
+import time
+import logging
+from telegram import Bot
 from datetime import datetime
-from twilio.rest import Client
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
-from textblob import TextBlob
-from io import StringIO
-
+import pytz
+from concurrent.futures import ThreadPoolExecutor
 
 # ========================= CONFIG =========================
-TWILIO_SID = os.environ.get('TWILIO_SID')
-TWILIO_TOKEN = os.environ.get('TWILIO_TOKEN')
-FROM = os.environ.get('FROM', 'whatsapp:+14155238886')
-TO = [f"whatsapp:{n}" for n in os.environ.get('TO', '').split(',') if n]
-STOCK_FILE = '/data/hot_stocks.txt'  # ← This saves file forever
-START, END = "08:30", "15:00"
-WIN = 5
-PCT = 1.2
-VOL = 2.0
-SENTIMENT_MIN = 0.3
+TELEGRAM_TOKEN = '8495322474:AAEh2inn7ArIj2GAkSfm0iQWqVc5gE_UyFA'
+CHAT_ID = '7276470276'
 
-# Filters
-PRICE_ACCEL_MIN = 0.4
-VOL_SPIKE_MIN = 3.0
-VOLA_SPIKE_MIN = 0.003
-
-USE_DYNAMIC_UPDATE = True
-UPDATE_MAX_AGE_DAYS = 7  # Only update if file older than this
+TRADING_START_CST = "08:30"
+TRADING_END_CST = "15:00"
+WINDOW_MINUTES = 5
+MIN_PRICE_SURGE_PCT = 1.2
+MIN_VOLUME_MULTIPLIER = 2.0
 
 CST = pytz.timezone('America/Chicago')
-STOCK_FILE = 'hot_stocks.txt'
+MAX_WORKERS = 50
 # ==========================================================
 
-# === LOGGING ===
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
-log = logging.getLogger()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
 
-# === TWILIO ===
-client = Client(TWILIO_SID, TWILIO_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# === CORE 300+ HIGH-VOLUME STOCKS ===
-CORE_STOCKS = list(dict.fromkeys([
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC', 'ORCL',
-    'CRM', 'ADBE', 'NFLX', 'PYPL', 'EBAY', 'SNAP', 'PINS', 'UBER', 'LYFT', 'RBLX',
-    'SMCI', 'ARM', 'AVGO', 'QCOM', 'TXN', 'MU', 'ASML', 'LRCX', 'KLAC', 'AMAT',
-    'SNOW', 'CRWD', 'ZS', 'PANW', 'FTNT', 'DDOG', 'NET', 'MDB', 'HUBS', 'TEAM',
-    'COIN', 'HOOD', 'SOFI', 'UPST', 'AFRM', 'MARA', 'RIOT', 'CLSK', 'BITF',
-    'LCID', 'RIVN', 'NIO', 'XPEV', 'LI', 'BLNK', 'CHPT', 'PLUG', 'FCEL', 'BE',
-    'HIMS', 'CLOV', 'OSCR', 'TDOC', 'RXRX', 'VIR', 'MRNA', 'BNTX', 'NVAX', 'GME',
-    'AMC', 'BB', 'KOSS', 'SPCE', 'RKLB', 'ASTS', 'PATH', 'U', 'AI', 'SOUN',
-    'BABA', 'PDD', 'JD', 'BIDU', 'NTES', 'TME', 'BZ', 'VIPS', 'IQ', 'WB',
-    'SPY', 'QQQ', 'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'LABU', 'LABD', 'SPXL', 'SPXS',
-    'ARKK', 'ARKQ', 'ARKW', 'ARKG', 'ARKF', 'IBIT', 'GBTC', 'BITO', 'MSTR',
-    'PLTR', 'IONQ', 'RGTI', 'QBTS', 'QUBT', 'AUR', 'SATS', 'LUMN',
-    'BAC', 'WFC', 'JPM', 'C', 'GS', 'MS', 'SCHW', 'PFE', 'MRK', 'JNJ',
-    'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'HAL', 'KMI', 'WMB', 'ET', 'EPD',
-    'F', 'GM', 'HMC', 'TM', 'RACE', 'STLA', 'NOC', 'LMT', 'RTX', 'BA',
-    'DIS', 'CMCSA', 'VZ', 'T', 'TMUS', 'CHTR', 'EA', 'TTWO', 'ROKU',
-    'SHOP', 'SE', 'MELI', 'NU', 'XP', 'ITUB', 'BBD', 'VALE', 'PBR', 'EC',
-    'TSM', 'INFY', 'HDB', 'WIT', 'VOD', 'BTI', 'UL', 'DEO', 'NVS',
-    'NVO', 'AZN', 'SNY', 'GSK', 'ABBV', 'LLY', 'TMO', 'DHR', 'ABT', 'MDT',
-    'UNH', 'CI', 'HUM', 'CVS', 'DG', 'DLTR', 'TGT', 'WMT',
-    'COST', 'HD', 'LOW', 'TJX', 'ROST', 'M', 'KSS', 'AEO',
-    'URBN', 'ANF', 'LULU', 'NKE', 'VFC', 'PVH', 'RL', 'TPR', 'CPRI',
-    'SIG', 'MOV', 'FOSL', 'CROX', 'DECK', 'COLM', 'UA', 'UAA',
-    'LUNG', 'INTS', 'CMBM', 'HBIO', 'ASST', 'BYND', 'BQ'
-]))
-
-# === LOAD STOCK LIST ===
-def load_stocks():
-    if os.path.exists(STOCK_FILE):
-        try:
-            age = time.time() - os.path.getmtime(STOCK_FILE)
-            if age > UPDATE_MAX_AGE_DAYS * 24 * 3600:
-                log.info(f"Stock file is {age/86400:.1f} days old — will update")
-            else:
-                with open(STOCK_FILE, 'r') as f:
-                    stocks = eval(f.read())
-                log.info(f"Loaded {len(stocks)} stocks from {STOCK_FILE} (fresh)")
-                return stocks[:300]
-        except Exception as e:
-            log.warning(f"Failed to load stock file: {e}")
-    return CORE_STOCKS[:300]
-
-HOT_STOCKS = load_stocks()
-
-# === 429-PROOF DYNAMIC UPDATE ===
-def update_stocks():
-    if not USE_DYNAMIC_UPDATE:
-        log.info("Dynamic update disabled")
-        return
-
-    # Skip if file is fresh
-    if os.path.exists(STOCK_FILE):
-        age = time.time() - os.path.getmtime(STOCK_FILE)
-        if age < UPDATE_MAX_AGE_DAYS * 24 * 3600:
-            log.info("Stock list is fresh — skipping update")
-            return
-
+# === FETCH 250 MOST ACTIVE via YFINANCE SCREENER (NO SCRAPING) ===
+def fetch_top_250_active():
     try:
-        log.info("Updating stock list from Yahoo (429-safe)...")
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-
-        for attempt in range(3):
-            try:
-                response = session.get("https://finance.yahoo.com/most-active", timeout=12)
-                response.raise_for_status()
-                break
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    wait = (2 ** attempt) * 10
-                    log.warning(f"Rate limited (429). Retry {attempt+1}/3 in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    raise
-            except Exception as e:
-                log.warning(f"Request failed: {e}. Retry {attempt+1}/3...")
-                time.sleep(5)
-        else:
-            raise Exception("Max retries failed")
-
-        # Wrap response.text in StringIO
-        tables = pd.read_html(StringIO(response.text))
-        df = tables[0]
-        symbols = df['Symbol'].head(500).dropna().tolist()
-
-        clean = [str(s).split('.')[0].upper() for s in symbols if pd.notna(s)]
-        clean = [s for s in clean if s.isalpha()]
-
-        new_add = [s for s in clean if s not in CORE_STOCKS][:100]
-        updated = CORE_STOCKS + new_add
-
-        with open(STOCK_FILE, 'w') as f:
-            f.write(repr(updated[:300]))
-
-        log.info(f"Updated: {len(updated)} → capped at 300")
-        global HOT_STOCKS
-        HOT_STOCKS = updated[:300]
-
-    except Exception as e:
-        log.error(f"Update failed: {e} → using core list")
+        # yfinance built-in screener
+        screen = yf.Tickers(' '.join(['AAPL']))  # Dummy to init
+        df = yf.utils.get_screeners(['most_actives'])['most_actives']
         
-# === DYNAMIC SELECTION ===
-def get_stocks():
-    now = datetime.now(CST)
-    is_market = START <= now.strftime("%H:%M") < END and now.weekday() < 5
-    return HOT_STOCKS if is_market else HOT_STOCKS[:30]
+        # Extract symbols
+        tickers = df['Symbol'].tolist()[:300]  # Get extra
+        tickers = [t.replace('.', '-') for t in tickers]  # Fix format
+        tickers = list(dict.fromkeys(tickers))[:250]  # Dedupe + cap
+        
+        logger.info(f"Fetched {len(tickers)} most active tickers via yfinance screener.")
+        return tickers
+    except Exception as e:
+        logger.warning(f"Screener failed: {e}, using fallback.")
+        return get_fallback_top_250()
 
-# === ML + SENTIMENT + SCAN (unchanged from v7) ===
-scaler = StandardScaler()
-model = IsolationForest(contamination=0.05, n_estimators=50, max_samples=64, random_state=42)
-model_trained = False
-TRAIN_STOCKS = ['TSLA', 'NVDA', 'AAPL', 'MSTR', 'PLTR']
-sentiment_cache = {}
 
-def send(msg):
-    success = 0
-    for num in TO:
-        try:
-            client.messages.create(body=msg, from_=FROM, to=num)
-            log.info(f"Sent to {num}")
-            success += 1
-            time.sleep(1.1)
-        except Exception as e:
-            log.error(f"Failed to {num}: {e}")
-    return success
+# === FALLBACK: 250 HIGH-VOLUME TICKERS (GUARANTEED) ===
+def get_fallback_top_250():
+    return [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AMD', 'SMCI', 'ARM',
+        'AVGO', 'QCOM', 'TXN', 'MU', 'ASML', 'LRCX', 'KLAC', 'AMAT', 'SNOW', 'CRWD',
+        'ZS', 'PANW', 'FTNT', 'DDOG', 'NET', 'MDB', 'HUBS', 'TEAM', 'COIN', 'HOOD',
+        'SOFI', 'UPST', 'AFRM', 'MARA', 'RIOT', 'CLSK', 'BITF', 'LCID', 'RIVN', 'NIO',
+        'XPEV', 'LI', 'BLNK', 'CHPT', 'PLUG', 'FCEL', 'BE', 'HIMS', 'CLOV', 'OSCR',
+        'TDOC', 'RXRX', 'VIR', 'MRNA', 'BNTX', 'NVAX', 'GME', 'AMC', 'BB', 'KOSS',
+        'SPCE', 'RKLB', 'ASTS', 'BABA', 'PDD', 'JD', 'BIDU', 'NTES', 'TME', 'BZ',
+        'VIPS', 'IQ', 'WB', 'SPY', 'QQQ', 'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'LABU',
+        'LABD', 'SPXL', 'SPXS', 'ARKK', 'ARKQ', 'ARKW', 'ARKG', 'ARKF', 'IBIT',
+        'GBTC', 'BITO', 'MSTR', 'SOUN', 'PLTR', 'IONQ', 'RGTI', 'QBTS', 'QUBT',
+        'AUR', 'PATH', 'U', 'AI', 'SATS', 'LUMN', 'BAC', 'WFC', 'JPM', 'C', 'GS',
+        'MS', 'SCHW', 'PFE', 'MRK', 'JNJ', 'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'HAL',
+        'KMI', 'WMB', 'ET', 'EPD', 'F', 'GM', 'HMC', 'TM', 'RACE', 'STLA', 'NOC',
+        'LMT', 'RTX', 'BA', 'DIS', 'CMCSA', 'VZ', 'T', 'TMUS', 'CHTR', 'EA', 'TTWO',
+        'ROKU', 'SHOP', 'SE', 'MELI', 'NU', 'XP', 'ITUB', 'BBD', 'VALE', 'PBR', 'EC',
+        'TSM', 'INFY', 'HDB', 'WIT', 'VOD', 'BTI', 'UL', 'DEO', 'NVS', 'NVO', 'AZN',
+        'SNY', 'GSK', 'ABBV', 'LLY', 'TMO', 'DHR', 'ABT', 'MDT', 'UNH', 'CI', 'HUM',
+        'CVS', 'DG', 'DLTR', 'TGT', 'WMT', 'COST', 'HD', 'LOW', 'TJX', 'ROST', 'M',
+        'KSS', 'AEO', 'URBN', 'ANF', 'LULU', 'NKE', 'VFC', 'PVH', 'RL', 'TPR', 'CPRI',
+        'SIG', 'MOV', 'CROX', 'DECK', 'COLM', 'UA', 'UAA', 'CCL', 'RCL', 'NCLH', 'DAL',
+        'AAL', 'UAL', 'LUV', 'SAVE', 'JBLU', 'ALK', 'HA', 'MESA', 'SKYW', 'EXPR',
+        'GME', 'AMC', 'BBBY', 'KODK', 'DKS', 'HIBB', 'FL', 'GPS', 'JWN', 'EXPR'
+    ][:250]
 
-def get_sentiment(symbol):
-    if symbol in sentiment_cache and time.time() - sentiment_cache[symbol][1] < 30:
-        return sentiment_cache[symbol][0]
-    score = count = 0
+
+# === GLOBAL ===
+HOT_STOCKS = []
+
+
+# === ULTRA-FAST SYNC FETCH ===
+def fetch_ticker_sync(symbol):
     try:
-        r = requests.get(f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json", timeout=3)
-        if r.status_code == 200:
-            for msg in r.json().get('messages', [])[:10]:
-                blob = TextBlob(msg['body'])
-                score += blob.sentiment.polarity
-                count += 1
-    except: pass
-    final = score / count if count > 0 else 0.0
-    sentiment_cache[symbol] = (final, time.time())
-    return final
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1d", interval="1m", prepost=False, timeout=8)
+        if hist.empty or len(hist) < WINDOW_MINUTES:
+            return None
 
-def train_ml():
-    global model_trained
-    feats = []
-    log.info("TRAINING ML (2s)...")
-    tickers = yf.Tickers(' '.join(TRAIN_STOCKS))
-    for s in TRAIN_STOCKS:
-        try:
-            h = tickers.tickers[s].history(period="1d", interval="1m", prepost=False)
-            if len(h) < 80: continue
-            c, v = h['Close'].values, h['Volume'].values
-            for i in range(20, len(h)-5, 15):
-                p = c[i:i+5]; vol = v[i:i+5]
-                if len(p) < 2: continue
-                prev = np.mean(v[:i]) if i > 0 else 1
-                feats.append([
-                    (p[-1]/p[0]-1)*100,
-                    np.mean(vol)/prev,
-                    np.std(np.diff(p)/p[:-1]) if len(p)>1 else 0,
-                    np.max(vol)/(np.mean(vol)+1e-8)
-                ])
-                if len(feats) >= 80: break
-        except: pass
-    if len(feats) >= 20:
-        model.fit(scaler.fit_transform(feats))
-        model_trained = True
-        log.info(f"ML TRAINED | {len(feats)} samples")
+        recent = hist.tail(WINDOW_MINUTES)
+        price_start = recent['Close'].iloc[0]
+        price_end = recent['Close'].iloc[-1]
+        if price_start <= 0 or price_end <= 0:
+            return None
 
-def is_surge(h, symbol):
-    if len(h) < WIN + 20: return False
-    r = h.tail(WIN)
-    pch = (r['Close'].iloc[-1] / r['Close'].iloc[0] - 1) * 100
-    if pch < PCT: return False
-    early = h['Volume'].head(20).replace(0, np.nan).mean()
-    recent = r['Volume'].mean()
-    if pd.isna(early) or early == 0: return False
-    vrat = recent / early
-    if vrat < VOL: return False
-    vol_spike = r['Volume'].max() / (r['Volume'].mean() + 1e-8)
-    price_accel = (r['Close'].iloc[-1] / r['Close'].iloc[-2] - 1) * 100 if len(r) >= 2 else 0
-    vola = np.std(np.diff(r['Close']) / r['Close'][:-1]) if len(r) > 1 else 0
-    sentiment = get_sentiment(symbol)
-    if sentiment < SENTIMENT_MIN: return False
-    ml_ok = True
-    if model_trained:
-        try:
-            f = np.array([[pch, vrat, vola, vol_spike]])
-            ml_ok = model.predict(scaler.transform(f))[0] == -1
-        except: ml_ok = True
-    return (ml_ok and vol_spike >= VOL_SPIKE_MIN and price_accel >= PRICE_ACCEL_MIN and vola >= VOLA_SPIKE_MIN)
+        price_change = ((price_end / price_start) - 1) * 100
+        volume_ratio = recent['Volume'].mean() / hist['Volume'].head(20).mean()
 
-def scan():
-    now = datetime.now(CST)
-    if not (START <= now.strftime("%H:%M") < END and now.weekday() < 5):
-        log.info("Market closed")
+        if price_change >= MIN_PRICE_SURGE_PCT and volume_ratio >= MIN_VOLUME_MULTIPLIER:
+            return {
+                'symbol': symbol,
+                'change': price_change,
+                'volume': volume_ratio
+            }
+    except Exception:
+        pass
+    return None
+
+
+# === ULTRA-FAST ASYNC SCAN ===
+async def ultra_fast_scan_async():
+    if not is_market_open():
+        logger.info("Market closed (CST)")
         return
-    stocks = get_stocks()
-    active = sum(1 for s in stocks if len(yf.Ticker(s).history(period="1d", interval="1m")) >= 25)
-    log.info(f"SCANNING {active}/{len(stocks)} @ {now.strftime('%H:%M')} CST")
-    alerts = 0
-    for s in stocks:
+
+    current_time = datetime.now(CST).strftime("%H:%M")
+    logger.info(f"SCANNING TOP 250 @ {current_time} CST | {len(HOT_STOCKS)} stocks")
+
+    start_time = time.time()
+    loop = asyncio.get_event_loop()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        tasks = [loop.run_in_executor(executor, fetch_ticker_sync, s) for s in HOT_STOCKS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    alerts = [r for r in results if isinstance(r, dict)]
+    duration = time.time() - start_time
+
+    logger.info(f"Scan complete in {duration:.2f}s | {len(alerts)} surge(s) detected!")
+
+    for alert in alerts:
+        message = (
+            f"<b>TOP 250 SURGE!</b>\n\n"
+            f"<b>{alert['symbol']}</b>\n"
+            f"+{alert['change']:.2f}%\n"
+            f"{alert['volume']:.1f}x Volume\n"
+            f"{current_time} CST\n"
+            f"<a href='https://finance.yahoo.com/quote/{alert['symbol']}'>TRADE NOW</a>"
+        )
+        await send_telegram(message)
         try:
-            h = yf.Ticker(s).history(period="1d", interval="1m", prepost=False, timeout=8)
-            if is_surge(h, s):
-                pch = (h.tail(WIN)['Close'].iloc[-1] / h.tail(WIN)['Close'].iloc[0] - 1) * 100
-                vrat = h.tail(WIN)['Volume'].mean() / h['Volume'].head(20).replace(0, np.nan).mean()
-                sent = get_sentiment(s)
-                msg = f"SURGE!\n{s}\n+{pch:.2f}%\n{vrat:.1f}x\nSent: {sent:+.2f}\n{now.strftime('%H:%M')} CST\nhttps://finance.yahoo.com/quote/{s}"
-                if send(msg):
-                    log.info(f"ALERT #{alerts+1}: {s} +{pch:.2f}% | S:{sent:+.2f}")
-                    alerts += 1
-                    try: __import__('winsound').Beep(2400, 900)
-                    except: pass
-            time.sleep(0.035)
-        except: continue
-    log.info(f"Done: {alerts} alert(s)")
-
-# === MAIN ===
-if __name__ == '__main__':
-    if len(TWILIO_SID) < 10 or not TO:
-        print("SET TWILIO_SID, TWILIO_TOKEN, TO")
-    else:
-        train_ml()
-        update_stocks()  # Safe update at startup
-        schedule.every(60).seconds.do(scan)
-        log.info("BOT v8 LIVE | 429-PROOF | 30→300+ | ML+SENTIMENT")
-        try:
-            while True:
-                schedule.run_pending()
-                time.sleep(1)
-        except KeyboardInterrupt:
-            log.info("Stopped")
+            import winsound
+            winsound.Beep(1600, 700)
+        except:
+            pass
 
 
-# ===================================================================
-# 1. What's New & Fixed (v8)
-# ===================================================================
-"""
-- 429-PROOF UPDATE: Retry 3x with backoff, browser headers
-- FRESHNESS CHECK: Only update if file >7 days old
-- SAFE FALLBACK: Always uses core list if update fails
-- NO WEEKLY SPAM: Update runs once at startup
-- PERSISTENT: hot_stocks.txt survives restarts
-- ML, Sentiment, Filters: All v7 features preserved
-- SPEED: ~10s scan, 2s ML train
-"""
+# === TELEGRAM ===
+async def send_telegram(message):
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
+        symbol = message.split('<b>')[2].split('</b>')[0]
+        logger.info(f"Telegram alert sent: {symbol}")
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
 
-# ===================================================================
-# 2. Final Notes
-# ===================================================================
-"""
-- FIRST RUN: Creates hot_stocks.txt on update
-- SANDBOX: All TO[] numbers must send 'join <code>' to +14155238886
-- UPDATE: Runs at startup if file >7 days old
-- TEST: Set PCT=0.1 to force alert
-- UPGRADE: Want Finnhub (zero 429)? Chart images? Web UI?
-- LOGS: Watch for 'Updated', 'ALERT', '429'
-"""
-# ===================================================================
+
+# === MARKET HOURS ===
+def is_market_open():
+    now = datetime.now(CST)
+    if now.weekday() >= 5:
+        return False
+    current = now.strftime("%H:%M")
+    return TRADING_START_CST <= current < TRADING_END_CST
+
+
+# === WRAPPER ===
+def ultra_fast_scan():
+    asyncio.run(ultra_fast_scan_async())
+
+
+# === MAIN LOOP ===
+def start_bot():
+    global HOT_STOCKS
+    if not TELEGRAM_TOKEN or 'YOUR_' in TELEGRAM_TOKEN:
+        logger.error("UPDATE TELEGRAM_TOKEN!")
+        return
+
+    HOT_STOCKS = fetch_top_250_active()
+    if len(HOT_STOCKS) < 100:
+        HOT_STOCKS = get_fallback_top_250()
+
+    logger.info(f"Loaded {len(HOT_STOCKS)} high-volume stocks")
+    logger.info("TOP 250 STOCK SURGE BOT STARTED! (v2.4 FINAL)")
+
+    schedule.every(60).seconds.do(ultra_fast_scan)
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+
+
+# === RUN ===
+if __name__ == "__main__":
+    start_bot()
