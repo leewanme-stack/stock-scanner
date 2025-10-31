@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: stock-scanner-bot
+    env: python
+    region: oregon
+    plan: starter  # or pro — whatever you bought
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scanner.py
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    autoDeploy: true

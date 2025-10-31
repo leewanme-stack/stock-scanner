@@ -1,0 +1,9 @@
+yfinance
+pandas
+numpy
+requests
+pytz
+schedule
+twilio
+scikit-learn
+textblob
