@@ -2,9 +2,10 @@ yfinance==0.2.43
 pandas
 numpy
 requests
-pytz
 twilio
 scikit-learn
 python-telegram-bot==21.5
 schedule==1.2.2
 textblob
+websockets==12.0
+pytz==2024.2
