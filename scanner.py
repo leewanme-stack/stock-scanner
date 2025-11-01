@@ -1,174 +1,172 @@
-# surge_hunter_v11.0.py - RENDER READY
-import yfinance as yf
+# scanner_v2.py - REAL-TIME SURGE HUNTER v12.1 | FREE TIER (T STREAM)
 import asyncio
-import schedule
-import time
+import json
 import logging
 import os
-from telegram import Bot
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
 import pytz
-from concurrent.futures import ThreadPoolExecutor
+import websockets
+from telegram import Bot
 
 # ========================= CONFIG =========================
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
+POLYGON_API_KEY = os.getenv('POLYGON_API_KEY', 'gXgSS76DhP76m_JlAvJhEg4MkvvKtfaV')
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise ValueError("Set TELEGRAM_TOKEN and CHAT_ID as Environment Variables!")
+    raise ValueError("Set TELEGRAM_TOKEN and CHAT_ID in env!")
 
-TRADING_START_CST = "08:30"
-TRADING_END_CST = "15:00"
-WINDOW_MINUTES = 5
-MIN_PRICE_SURGE_PCT = 0.6
-MIN_VOLUME_MULTIPLIER = 1.5
-MIN_PRICE = 0.5
-MIN_VOLUME_5MIN = 50_000
+# Surge thresholds
+MIN_PRICE = 0.50
+MIN_VOLUME_1MIN = 100_000
+VOLUME_MULTIPLIER = 3.0
+PRICE_JUMP_PCT = 0.8
 
-CST = pytz.timezone('America/Chicago')
-MAX_WORKERS = 100
+# Cooldown
+ALERT_COOLDOWN = 15 * 60
+COOLDOWN_TRACKER = {}
 
-# RELATIVE PATH FOR RENDER
-TICKERS_FILE_PATH = './tickers.txt'
+# Baseline: 20 mins
+BASELINE_WINDOW = 20
+volume_history = defaultdict(lambda: deque(maxlen=BASELINE_WINDOW))
+
+# Markets
+VALID_EXCHANGES = {1, 2, 3, 4, 5, 8}
+
+# WebSocket
+WS_URL = "wss://socket.polygon.io/stocks"
+
+# In-memory 1-min buffer
+current_minute = None
+minute_buffer = defaultdict(lambda: {'volume': 0, 'price': 0, 'count': 0})
+last_flush = 0
 # ==========================================================
 
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Render logs to stdout
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === LOAD TICKERS ===
-def load_tickers_from_file():
-    if not os.path.exists(TICKERS_FILE_PATH):
-        raise FileNotFoundError(f"tickers.txt not found in project root!")
-    
-    try:
-        with open(TICKERS_FILE_PATH, 'r', encoding='utf-8') as f:
-            raw_tickers = [line.strip() for line in f if line.strip()]
-        
-        cleaned = [t.strip().upper() for t in raw_tickers 
-                  if 1 <= len(t.strip()) <= 5 and t.strip().replace('.', '').isalnum()]
-        tickers = sorted(list(set(cleaned)))
-        
-        logger.info(f"Loaded {len(tickers)} tickers from tickers.txt")
-        return tickers
-    except Exception as e:
-        raise RuntimeError(f"Failed to load tickers: {e}")
+ET = pytz.timezone('US/Eastern')
+CST = pytz.timezone('America/Chicago')
 
-ALL_TICKERS = load_tickers_from_file()
-LIVE_TICKERS = ALL_TICKERS.copy()
+def is_market_open():
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return datetime.strptime("09:30", "%H:%M").time() <= t < datetime.strptime("16:00", "%H:%M").time()
 
-def refresh_tickers():
-    global LIVE_TICKERS
-    LIVE_TICKERS = load_tickers_from_file()
-    logger.info(f"Refreshed: {len(LIVE_TICKERS)} tickers")
-
-# === SURGE DETECTION (UNCHANGED) ===
-def detect_surge(symbol):
-    try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d", interval="1m", prepost=False, timeout=6)
-        if hist.empty or len(hist) < WINDOW_MINUTES + 10:
-            return None
-
-        recent = hist.tail(WINDOW_MINUTES)
-        price_start = recent['Close'].iloc[0]
-        price_end = recent['Close'].iloc[-1]
-        if price_start <= 0 or price_end <= 0:
-            return None
-
-        price_change = ((price_end / price_start) - 1) * 100
-        recent_vol = recent['Volume'].mean()
-        baseline_vol = hist['Volume'].head(20).mean()
-        volume_ratio = recent_vol / baseline_vol if baseline_vol > 0 else 0
-
-        if (price_end >= MIN_PRICE and 
-            recent_vol >= MIN_VOLUME_5MIN and 
-            price_change >= MIN_PRICE_SURGE_PCT and 
-            volume_ratio >= MIN_VOLUME_MULTIPLIER):
-            
-            return {
-                'symbol': symbol,
-                'change': price_change,
-                'volume': volume_ratio,
-                'price': price_end,
-                'vol_5min': int(recent_vol)
-            }
-    except:
-        pass
-    return None
-
-# === SCAN + ALERTS (UNCHANGED) ===
-async def dynamic_surge_scan():
-    if not is_market_open():
-        return
-
-    current_time = datetime.now(CST).strftime("%H:%M")
-    logger.info(f"SCANNING {len(LIVE_TICKERS)} TICKERS @ {current_time} CST")
-
-    start_time = time.time()
-    loop = asyncio.get_event_loop()
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        tasks = [loop.run_in_executor(executor, detect_surge, s) for s in LIVE_TICKERS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    alerts = [r for r in results if isinstance(r, dict)]
-    duration = time.time() - start_time
-
-    logger.info(f"Scan complete in {duration:.1f}s | {len(alerts)} surges!")
-
-    for alert in alerts:
-        message = (
-            f"<b>SURGE DETECTED!</b>\n\n"
-            f"<b>{alert['symbol']}</b> @ ${alert['price']:.3f}\n"
-            f"+{alert['change']:.2f}% (5 min)\n"
-            f"{alert['volume']:.1f}x volume ({alert['vol_5min']:,} shares)\n"
-            f"{current_time} CST\n"
-            f"<a href='https://finance.yahoo.com/quote/{alert['symbol']}'>TRADE NOW</a>"
-        )
-        await send_telegram(message)
-
-async def send_telegram(message):
+async def send_alert(symbol, price, change_pct, volume, ratio):
+    now_cst = datetime.now(CST).strftime("%H:%M")
+    message = (
+        f"<b>REAL-TIME SURGE!</b>\n\n"
+        f"<b>{symbol}</b> @ ${price:.3f}\n"
+        f"+{change_pct:.2f}% (1 min)\n"
+        f"{ratio:.1f}x volume ({volume:,} shares)\n"
+        f"{now_cst} CST\n"
+        f"<a href='https://finance.yahoo.com/quote/{symbol}'>TRADE NOW</a>"
+    )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
-        symbol = message.split('<b>')[1].split('</b>')[0]
-        logger.info(f"🚀 ALERT → {symbol}")
+        logger.info(f"ALERT → {symbol}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-def is_market_open():
-    now = datetime.now(CST)
-    if now.weekday() >= 5:
-        return False
-    current = now.strftime("%H:%M")
-    return TRADING_START_CST <= current < TRADING_END_CST
+async def process_minute_bar(symbol, price, volume):
+    global volume_history
 
-def run_scan():
-    asyncio.run(dynamic_surge_scan())
+    if price < MIN_PRICE or volume < MIN_VOLUME_1MIN:
+        return
 
-# === MAIN LOOP ===
-def start_hunter():
-    logger.info("🚀 SURGE HUNTER v11.0 LIVE ON RENDER!")
-    refresh_tickers()
-    
-    schedule.every(60).seconds.do(run_scan)
-    schedule.every(30).minutes.do(refresh_tickers)
+    # Update baseline
+    volume_history[symbol].append(volume)
+    if len(volume_history[symbol]) < 2:
+        return
+    baseline = sum(volume_history[symbol][:-1]) / len(volume_history[symbol][:-1])
+    if baseline <= 0:
+        return
 
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Hunter stopped.")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+    ratio = volume / baseline
+
+    # Estimate price change (use last known)
+    prev_price = 0
+    for prev_vol in reversed(volume_history[symbol]):
+        prev_price = price * 0.99  # fallback
+        break
+    change_pct = ((price / prev_price) - 1) * 100 if prev_price > 0 else 0
+
+    if ratio >= VOLUME_MULTIPLIER and change_pct >= PRICE_JUMP_PCT:
+        now = int(time.time())
+        if symbol not in COOLDOWN_TRACKER or now - COOLDOWN_TRACKER[symbol] >= ALERT_COOLDOWN:
+            COOLDOWN_TRACKER[symbol] = now
+            await send_alert(symbol, price, change_pct, volume, ratio)
+
+async def flush_minute():
+    global minute_buffer, current_minute, last_flush
+    now = time.time()
+    if now - last_flush < 55:  # Flush every ~60s
+        return
+
+    for symbol, data in minute_buffer.items():
+        if data['count'] > 0:
+            avg_price = data['price'] / data['count']
+            volume = data['volume']
+            if is_market_open():
+                await process_minute_bar(symbol, avg_price, volume)
+    minute_buffer.clear()
+    last_flush = now
+    minute_key = int(now // 60)
+    if minute_key != current_minute:
+        current_minute = minute_key
+
+async def connect_polygon():
+    auth_msg = json.dumps({"action": "auth", "params": POLYGON_API_KEY})
+    sub_msg = json.dumps({"action": "subscribe", "params": "T"})  # ALL TRADES
+
+    while True:
+        try:
+            logger.info("Connecting to Polygon WebSocket (T stream)...")
+            async with websockets.connect(WS_URL) as ws:
+                await ws.send(auth_msg)
+                resp = await ws.recv()
+                logger.info(f"Auth: {resp}")
+
+                await ws.send(sub_msg)
+                resp = await ws.recv()
+                logger.info(f"Subscribed to T: {resp}")
+
+                async for message in ws:
+                    data = json.loads(message)
+                    for ev in data:
+                        if ev.get('ev') == 'T':  # Trade
+                            symbol = ev['sym']
+                            price = ev['p']
+                            size = ev['s']
+                            exchange = ev.get('x', 0)
+
+                            if exchange not in VALID_EXCHANGES:
+                                continue
+
+                            minute_key = int(ev['t'] / 1_000_000_000 // 60)  # ns → min
+                            if current_minute is None:
+                                current_minute = minute_key
+
+                            minute_buffer[symbol]['volume'] += size
+                            minute_buffer[symbol]['price'] += price * size
+                            minute_buffer[symbol]['count'] += size
+
+                    await flush_minute()
+
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+async def main():
+    logger.info("REAL-TIME SURGE HUNTER v12.1 (FREE TIER) STARTED")
+    await connect_polygon()
 
 if __name__ == "__main__":
-    start_hunter()
+    asyncio.run(main())
