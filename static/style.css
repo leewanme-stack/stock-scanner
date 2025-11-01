@@ -1,0 +1,11 @@
+body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
+.header { text-align: center; margin-bottom: 30px; }
+.status-on { color: #00ff00; }
+.status-off { color: #ff0000; }
+#status { font-size: 18px; margin-top: 10px; }
+.alerts { max-width: 1200px; margin: 0 auto; }
+table { width: 100%; border-collapse: collapse; background: #333; }
+th, td { padding: 12px; text-align: left; border-bottom: 1px solid #555; }
+th { background: #444; }
+tr:hover { background: #444; }
+.positive { color: #00ff88; }

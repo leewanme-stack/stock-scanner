@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Surge Hunter Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 Surge Hunter v13.0</h1>
+        <div id="status">
+            <span id="connected" class="status-off">WS: Offline</span>
+            <span id="market" class="status-off">Market: Closed</span>
+            <span id="alerts-count">Alerts: 0</span>
+            <span id="active">Active: 0</span>
+        </div>
+    </div>
+    <div class="alerts">
+        <h2>Recent Surges</h2>
+        <table id="alerts-table">
+            <thead>
+                <tr><th>Symbol</th><th>Price</th><th>Change</th><th>Vol Ratio</th><th>Volume</th><th>Time</th></tr>
+            </thead>
+            <tbody id="alerts-body"></tbody>
+        </table>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
